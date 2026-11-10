@@ -1,36 +1,22 @@
-"""
-EMEdit model.
-"""
-
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Optional, Sequence, Tuple
+import math
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _as_sequence(x: torch.Tensor) -> torch.Tensor:
-    """Return a time-series tensor as [B, 1, L]."""
+def as_sequence(x: torch.Tensor) -> torch.Tensor:
     if x.dim() == 2:
         return x.unsqueeze(1)
-    if x.dim() == 3:
-        return x
-    raise ValueError(f"Expected ts with shape [B, L] or [B, C, L], got {tuple(x.shape)}")
-
-
-def _flatten_output(x: torch.Tensor) -> torch.Tensor:
-    """Return decoder output as [B, L]."""
     if x.dim() == 3 and x.size(1) == 1:
-        return x.squeeze(1)
-    return x
+        return x
+    raise ValueError(f"Expected [B, L] or [B, 1, L], got {tuple(x.shape)}")
 
 
 class ConvBranch(nn.Module):
-    """One temporal branch with a distinct receptive field."""
-
     def __init__(self, in_channels: int, hidden_dim: int, kernel_size: int, dropout: float):
         super().__init__()
         padding = kernel_size // 2
@@ -47,8 +33,6 @@ class ConvBranch(nn.Module):
 
 
 class ResidualTemporalBlock(nn.Module):
-    """Residual temporal refinement block B^(l)."""
-
     def __init__(self, dim: int, kernel_size: int = 3, dropout: float = 0.1):
         super().__init__()
         padding = kernel_size // 2
@@ -65,36 +49,27 @@ class ResidualTemporalBlock(nn.Module):
 
 
 class MultiResolutionTSEncoder(nn.Module):
-    """
-    EMEdit time-series encoder:
-        H_ts^(0) = Concat[phi_1(X), ..., phi_R(X)]
-        H_ts^(l) = H_ts^(l-1) + B^(l)(H_ts^(l-1))
-        E_ts = MLP(Pool(H_ts^(N)))
-    """
-
     def __init__(
         self,
-        ts_dim: int,
         output_dim: int,
-        in_channels: int = 1,
         branch_kernels: Sequence[int] = (3, 5, 9, 15),
         branch_dim: Optional[int] = None,
         num_res_blocks: int = 2,
         dropout: float = 0.1,
     ):
         super().__init__()
-        self.ts_dim = ts_dim
-        self.output_dim = output_dim
         branch_dim = branch_dim or max(32, output_dim // len(branch_kernels))
-
         self.branches = nn.ModuleList(
-            [ConvBranch(in_channels, branch_dim, k, dropout) for k in branch_kernels]
+            [ConvBranch(1, branch_dim, kernel, dropout) for kernel in branch_kernels]
         )
         concat_dim = branch_dim * len(branch_kernels)
         self.res_blocks = nn.Sequential(
-            *[ResidualTemporalBlock(concat_dim, kernel_size=3, dropout=dropout) for _ in range(num_res_blocks)]
+            *[
+                ResidualTemporalBlock(concat_dim, 3, dropout)
+                for _ in range(num_res_blocks)
+            ]
         )
-        self.proj = nn.Sequential(
+        self.projection = nn.Sequential(
             nn.Linear(concat_dim, output_dim),
             nn.LayerNorm(output_dim),
             nn.GELU(),
@@ -103,16 +78,14 @@ class MultiResolutionTSEncoder(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = _as_sequence(x)  # [B, C, L]
-        features = torch.cat([branch(x) for branch in self.branches], dim=1)  # [B, R*d, L]
+        x = as_sequence(x)
+        features = torch.cat([branch(x) for branch in self.branches], dim=1)
         features = self.res_blocks(features)
-        pooled = F.adaptive_avg_pool1d(features, output_size=1).squeeze(-1)
-        return F.normalize(self.proj(pooled), dim=-1)
+        pooled = F.adaptive_avg_pool1d(features, 1).squeeze(-1)
+        return self.projection(pooled)
 
 
-class PatchMLPTextEncoder(nn.Module):
-    """Patch-MLP projection head for pretrained text embeddings."""
-
+class TextProjection(nn.Module):
     def __init__(self, text_dim: int, output_dim: int, dropout: float = 0.1):
         super().__init__()
         hidden_dim = max(output_dim, min(4096, text_dim))
@@ -124,49 +97,113 @@ class PatchMLPTextEncoder(nn.Module):
             nn.Linear(hidden_dim, output_dim),
         )
 
-    def forward(self, text_features: torch.Tensor) -> torch.Tensor:
-        if text_features.dim() > 2:
-            text_features = text_features.flatten(start_dim=1)
-        return F.normalize(self.net(text_features.float()), dim=-1)
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        leading_shape = features.shape[:-1]
+        flattened = features.reshape(-1, features.size(-1))
+        projected = self.net(flattened.float())
+        return projected.reshape(*leading_shape, projected.size(-1))
 
 
-class GatedFusion(nn.Module):
-    """Metadata-guided gated fusion G(x, meta)."""
-
-    def __init__(self, dim: int, dropout: float = 0.1):
+class EventConditionedMetadataRouter(nn.Module):
+    def __init__(self, dim: int):
         super().__init__()
-        self.gate = nn.Sequential(nn.Linear(dim * 2, dim), nn.Sigmoid())
-        self.candidate = nn.Sequential(
-            nn.Linear(dim * 2, dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim, dim),
-        )
-        self.norm = nn.LayerNorm(dim)
+        self.query = nn.Linear(dim, dim, bias=False)
+        self.key = nn.Linear(dim, dim, bias=False)
+        self.value = nn.Linear(dim, dim, bias=False)
 
-    def forward(self, x: torch.Tensor, meta: torch.Tensor) -> torch.Tensor:
-        h = torch.cat([x, meta], dim=-1)
-        g = self.gate(h)
-        z = g * self.candidate(h) + (1.0 - g) * x
-        return F.normalize(self.norm(z), dim=-1)
+    def forward(
+        self,
+        event_embedding: torch.Tensor,
+        metadata_embedding: torch.Tensor,
+        stable_context_embeddings: Optional[torch.Tensor] = None,
+        stable_context_mask: Optional[torch.Tensor] = None,
+    ):
+        if stable_context_embeddings is None or stable_context_embeddings.numel() == 0:
+            return metadata_embedding, None
+
+        if stable_context_embeddings.dim() == 2:
+            stable_context_embeddings = stable_context_embeddings.unsqueeze(1)
+
+        batch_size, context_count, _ = stable_context_embeddings.shape
+        if stable_context_mask is None:
+            stable_context_mask = torch.ones(
+                batch_size,
+                context_count,
+                dtype=torch.bool,
+                device=stable_context_embeddings.device,
+            )
+        else:
+            stable_context_mask = stable_context_mask.to(
+                device=stable_context_embeddings.device,
+                dtype=torch.bool,
+            )
+
+        query = self.query(event_embedding).unsqueeze(1)
+        keys = self.key(stable_context_embeddings)
+        scores = (query * keys).sum(dim=-1) / math.sqrt(event_embedding.size(-1))
+        scores = scores.masked_fill(~stable_context_mask, -1e4)
+        weights = torch.softmax(scores, dim=-1)
+        weights = weights * stable_context_mask.to(weights.dtype)
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        context = torch.sum(
+            weights.unsqueeze(-1) * stable_context_embeddings,
+            dim=1,
+        )
+        routed = self.value(context)
+        has_context = stable_context_mask.any(dim=1, keepdim=True)
+        metadata_event = metadata_embedding + routed * has_context.to(routed.dtype)
+        return metadata_event, weights
+
+
+class SourceAnchoredDualPathFusion(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.metadata_gate = nn.Linear(dim * 2, dim)
+        self.event_gate = nn.Linear(dim * 3, dim)
+        self.metadata_projection = nn.Linear(dim, dim, bias=False)
+        self.event_projection = nn.Linear(dim, dim, bias=False)
+        self.routed_metadata_projection = nn.Linear(dim, dim, bias=False)
+
+    def forward(
+        self,
+        ts_embedding: torch.Tensor,
+        event_embedding: torch.Tensor,
+        metadata_embedding: torch.Tensor,
+        event_conditioned_metadata: torch.Tensor,
+    ):
+        gate_metadata = torch.sigmoid(
+            self.metadata_gate(torch.cat([ts_embedding, metadata_embedding], dim=-1))
+        )
+        gate_event = torch.sigmoid(
+            self.event_gate(
+                torch.cat(
+                    [ts_embedding, event_embedding, event_conditioned_metadata],
+                    dim=-1,
+                )
+            )
+        )
+        z_metadata = ts_embedding + gate_metadata * self.metadata_projection(metadata_embedding)
+        event_correction = (
+            self.event_projection(event_embedding)
+            + self.routed_metadata_projection(event_conditioned_metadata)
+        )
+        z_event = ts_embedding + gate_event * event_correction
+        return z_metadata, z_event
 
 
 class TransformerEditingDecoder(nn.Module):
-    """Transformer decoder that maps two fused tokens Stack(Z_ts, Z_e) to length L."""
-
     def __init__(
         self,
-        ts_dim: int,
         output_dim: int,
+        seq_length: int,
         num_layers: int = 4,
         num_heads: int = 8,
         dropout: float = 0.1,
     ):
         super().__init__()
         if output_dim % num_heads != 0:
-            # Keep the model robust for unusual hidden dimensions.
-            num_heads = 1
-        encoder_layer = nn.TransformerEncoderLayer(
+            raise ValueError("output_dim must be divisible by num_heads")
+        layer = nn.TransformerEncoderLayer(
             d_model=output_dim,
             nhead=num_heads,
             dim_feedforward=output_dim * 4,
@@ -175,218 +212,288 @@ class TransformerEditingDecoder(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.pos = nn.Parameter(torch.zeros(1, 2, output_dim))
-        self.blocks = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.position = nn.Parameter(torch.zeros(1, 2, output_dim))
+        self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
         self.head = nn.Sequential(
             nn.LayerNorm(output_dim * 2),
             nn.Linear(output_dim * 2, output_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(output_dim, ts_dim),
+            nn.Linear(output_dim, seq_length),
         )
 
-    def forward(self, fused_tokens: torch.Tensor) -> torch.Tensor:
-        if fused_tokens.dim() != 3 or fused_tokens.size(1) != 2:
-            raise ValueError(f"Expected fused tokens [B, 2, D], got {tuple(fused_tokens.shape)}")
-        h = self.blocks(fused_tokens + self.pos)
-        return self.head(h.flatten(start_dim=1))
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        if tokens.dim() != 3 or tokens.size(1) != 2:
+            raise ValueError(f"Expected [B, 2, D], got {tuple(tokens.shape)}")
+        hidden = self.transformer(tokens + self.position)
+        return self.head(hidden.flatten(start_dim=1))
 
 
 class RiemannianVolumeContrast(nn.Module):
-    """3-modal SPD Gram log-volume and hard-negative RVC objective."""
-
     def __init__(
         self,
-        eps: float = 1e-6,
-        base_tau: float = 0.3,
-        tau_min: float = 0.15,
-        tau_max: float = 0.9,
+        eps: float = 1e-4,
+        tau0: float = 0.07,
+        tau_min: float = 0.01,
+        tau_max: float = 1.0,
         top_k: int = 60,
+        eps_s: float = 1e-8,
     ):
         super().__init__()
         self.eps = eps
-        self.base_tau = base_tau
+        self.tau0 = tau0
         self.tau_min = tau_min
         self.tau_max = tau_max
         self.top_k = top_k
+        self.eps_s = eps_s
 
-    def log_volume_matrix(self, ts_emb: torch.Tensor, event_emb: torch.Tensor, meta_emb: torch.Tensor) -> torch.Tensor:
-        """
-        Construct S_ij = G_ij + eps*I and return V_ij = log det(S_ij).
+    def log_volume_matrix(
+        self,
+        ts_embedding: torch.Tensor,
+        event_embedding: torch.Tensor,
+        metadata_embedding: torch.Tensor,
+    ) -> torch.Tensor:
+        ts = F.normalize(ts_embedding.float(), dim=-1)
+        event = F.normalize(event_embedding.float(), dim=-1)
+        metadata = F.normalize(metadata_embedding.float(), dim=-1)
 
-        Pairing follows the paper: ts_i is paired with event_j and meta_j;
-        event_j-meta_j is computed within sample j and broadcast across i.
-        """
-        ts = F.normalize(ts_emb, dim=-1)
-        event = F.normalize(event_emb, dim=-1)
-        meta = F.normalize(meta_emb, dim=-1)
-        b_ts, b_text = ts.size(0), event.size(0)
-        device = ts.device
+        if ts.size(0) != event.size(0) or ts.size(0) != metadata.size(0):
+            raise ValueError("The three modalities must have the same batch size")
 
-        ones = torch.ones(b_ts, b_text, device=device, dtype=ts.dtype)
-        ts_event = ts @ event.T
-        ts_meta = ts @ meta.T
-        event_meta = torch.sum(event * meta, dim=-1).unsqueeze(0).expand(b_ts, -1)
+        batch_size = ts.size(0)
+        a = ts @ event.transpose(0, 1)
+        b = ts @ metadata.transpose(0, 1)
+        c = (event * metadata).sum(dim=-1).unsqueeze(0).expand(batch_size, -1)
+        ones = torch.ones_like(a)
 
         gram = torch.stack(
             [
-                torch.stack([ones, ts_event, ts_meta], dim=-1),
-                torch.stack([ts_event, ones, event_meta], dim=-1),
-                torch.stack([ts_meta, event_meta, ones], dim=-1),
+                torch.stack([ones, a, b], dim=-1),
+                torch.stack([a, ones, c], dim=-1),
+                torch.stack([b, c, ones], dim=-1),
             ],
             dim=-2,
         )
-        eye = torch.eye(3, device=device, dtype=ts.dtype).view(1, 1, 3, 3)
-        spd = gram + self.eps * eye
-        sign, logabsdet = torch.linalg.slogdet(spd.float())
-        # In exact arithmetic sign should be positive. Clamp for numerical safety.
-        safe_logdet = torch.where(sign > 0, logabsdet, torch.full_like(logabsdet, -30.0))
-        return safe_logdet.to(ts.dtype)
+        identity = torch.eye(3, device=gram.device, dtype=gram.dtype).view(1, 1, 3, 3)
+        spd = gram + self.eps * identity
+        sign, logdet = torch.linalg.slogdet(spd)
+        return torch.where(sign > 0, logdet, torch.full_like(logdet, -30.0))
 
-    def forward(self, ts_emb: torch.Tensor, event_emb: torch.Tensor, meta_emb: torch.Tensor) -> torch.Tensor:
-        return self.log_volume_matrix(ts_emb, event_emb, meta_emb)
+    def forward(
+        self,
+        ts_embedding: torch.Tensor,
+        event_embedding: torch.Tensor,
+        metadata_embedding: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.log_volume_matrix(ts_embedding, event_embedding, metadata_embedding)
 
-    def loss(self, log_volume: torch.Tensor) -> torch.Tensor:
-        """RVC loss: small matched log-volume, large hard-negative log-volume."""
+    def loss(
+        self,
+        log_volume: torch.Tensor,
+        valid_negative_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if log_volume.dim() != 2 or log_volume.size(0) != log_volume.size(1):
-            raise ValueError(f"RVC expects a square [B, B] matrix, got {tuple(log_volume.shape)}")
-        bsz = log_volume.size(0)
-        if bsz <= 1:
+            raise ValueError("RVC expects a square [B, B] log-volume matrix")
+
+        batch_size = log_volume.size(0)
+        if batch_size <= 1:
             return log_volume.new_zeros(())
 
-        tau = self.base_tau * (1.0 + log_volume.detach().abs().mean())
-        tau = torch.clamp(tau, min=self.tau_min, max=self.tau_max)
-        affinity = torch.exp(-log_volume / tau)
+        device = log_volume.device
+        diagonal = torch.eye(batch_size, dtype=torch.bool, device=device)
 
-        pos = affinity.diagonal()
-        neg = affinity.masked_fill(torch.eye(bsz, dtype=torch.bool, device=affinity.device), float("-inf"))
-        k = min(self.top_k, bsz - 1)
-        hard_neg = torch.topk(neg, k=k, dim=1).values
-        denom = pos + hard_neg.sum(dim=1) + self.eps
-        ratio = torch.clamp(pos / denom, min=self.eps, max=1.0 - self.eps)
-        weights = (1.0 - ratio).pow(2) + self.eps
-        return -(weights * torch.log(ratio)).mean()
+        if valid_negative_mask is None:
+            valid = ~diagonal
+        else:
+            if valid_negative_mask.shape != log_volume.shape:
+                raise ValueError("valid_negative_mask must have shape [B, B]")
+            valid = valid_negative_mask.to(device=device, dtype=torch.bool) & ~diagonal
+
+        tau = self.tau0 * (1.0 + log_volume.detach().abs().mean())
+        tau = torch.clamp(tau, min=self.tau_min, max=self.tau_max)
+        log_affinity = -log_volume.float() / tau.float()
+        candidate_mask = valid | diagonal
+        log_affinity = log_affinity.masked_fill(~candidate_mask, float("-inf"))
+        row_max = log_affinity.max(dim=1, keepdim=True).values
+        row_max = torch.where(torch.isfinite(row_max), row_max, torch.zeros_like(row_max))
+        affinity = torch.exp(log_affinity - row_max)
+
+        positive = affinity.diagonal()
+        negative = affinity.masked_fill(~valid, float("-inf"))
+        k = min(self.top_k, batch_size - 1)
+        selected = torch.topk(negative, k=k, dim=1).values
+        selected = torch.where(torch.isfinite(selected), selected, torch.zeros_like(selected))
+        denominator = positive + selected.sum(dim=1) + self.eps_s
+        ratio = (positive / denominator).clamp(
+            min=self.eps_s,
+            max=1.0 - self.eps_s,
+        )
+        row_loss = -(((1.0 - ratio).pow(2) + self.eps_s) * torch.log(ratio))
+        valid_rows = valid.any(dim=1)
+        if not valid_rows.any():
+            return log_volume.new_zeros(())
+        return row_loss[valid_rows].mean().to(log_volume.dtype)
 
 
 class EMEdit(nn.Module):
-    """
-    Event-Meta Counterfactual Time Series Editor.
-
-    Input:
-        ts:             [B, L]
-        event_features: [B, text_dim]  # Xe embedding, what to change
-        meta_features:  [B, text_dim]  # Xm embedding, what to preserve
-    Output dictionary contains x_hat and RVC-related embeddings.
-    """
-
     def __init__(
         self,
-        ts_dim: int,
+        seq_length: int,
         text_dim: int,
-        output_dim: int,
-        beta: float = 1.0,
-        ts_encoder: Optional[nn.Module] = None,
-        text_encoder: Optional[nn.Module] = None,
-        ts_decoder: Optional[nn.Module] = None,
-        variational: bool = False,
-        clip_mu: bool = False,
-        gen_w_src_text: bool = False,
+        hidden_dim: int = 768,
+        branch_kernels: Sequence[int] = (3, 5, 9, 15),
+        branch_dim: Optional[int] = None,
+        num_res_blocks: int = 2,
         decoder_layers: int = 4,
+        decoder_heads: int = 8,
         dropout: float = 0.1,
-        **_: object,
+        rvc_eps: float = 1e-4,
+        rvc_tau0: float = 0.07,
+        rvc_tau_min: float = 0.01,
+        rvc_tau_max: float = 1.0,
+        rvc_top_k: int = 60,
+        rvc_eps_s: float = 1e-8,
     ):
         super().__init__()
-        self.ts_dim = ts_dim
-        self.text_dim = text_dim
-        self.output_dim = output_dim
-        self.beta = beta
-        self.clip_mu = clip_mu
-        self.variational = variational
-        self.gen_w_src_text = gen_w_src_text
-
-        self.ts_encoder = ts_encoder or MultiResolutionTSEncoder(ts_dim, output_dim, dropout=dropout)
-        # Shared text encoder for event and metadata, consistent with EMEdit.
-        self.text_encoder = text_encoder or PatchMLPTextEncoder(text_dim, output_dim, dropout=dropout)
-        self.meta_encoder = self.text_encoder
-
-        self.gate_ts = GatedFusion(output_dim, dropout=dropout)
-        self.gate_event = GatedFusion(output_dim, dropout=dropout)
-        self.rvc = RiemannianVolumeContrast()
-        self.ts_decoder = ts_decoder or TransformerEditingDecoder(
-            ts_dim=ts_dim,
-            output_dim=output_dim,
-            num_layers=decoder_layers,
+        self.seq_length = seq_length
+        self.ts_encoder = MultiResolutionTSEncoder(
+            output_dim=hidden_dim,
+            branch_kernels=branch_kernels,
+            branch_dim=branch_dim,
+            num_res_blocks=num_res_blocks,
             dropout=dropout,
         )
+        self.text_projection = TextProjection(text_dim, hidden_dim, dropout)
+        self.metadata_router = EventConditionedMetadataRouter(hidden_dim)
+        self.dual_path_fusion = SourceAnchoredDualPathFusion(hidden_dim)
+        self.edit_gate = nn.Linear(hidden_dim * 3, hidden_dim)
+        self.decoder = TransformerEditingDecoder(
+            output_dim=hidden_dim,
+            seq_length=seq_length,
+            num_layers=decoder_layers,
+            num_heads=decoder_heads,
+            dropout=dropout,
+        )
+        self.rvc = RiemannianVolumeContrast(
+            eps=rvc_eps,
+            tau0=rvc_tau0,
+            tau_min=rvc_tau_min,
+            tau_max=rvc_tau_max,
+            top_k=rvc_top_k,
+            eps_s=rvc_eps_s,
+        )
 
-    def encode(self, ts: torch.Tensor, event_features: torch.Tensor, meta_features: torch.Tensor) -> Dict[str, torch.Tensor]:
-        e_ts = self.ts_encoder(ts)
-        e_event = self.text_encoder(event_features)
-        e_meta = self.meta_encoder(meta_features)
-        return {"ts": e_ts, "event": e_event, "meta": e_meta}
-
-    def fuse(self, e_ts: torch.Tensor, e_event: torch.Tensor, e_meta: torch.Tensor, w: float = 1.0) -> torch.Tensor:
-        """
-        Metadata-guided fusion H(E_ts, E_e, E_m) = Stack(G_ts(E_ts,E_m), G_e(E_e,E_m)).
-        w controls the latent editing strength of the event branch.
-        """
-        w = float(w)
-        # Latent interpolation: w=0 keeps event branch close to source; w=1 uses event semantics fully.
-        event_control = F.normalize((1.0 - w) * e_ts + w * e_event, dim=-1)
-        z_ts = self.gate_ts(e_ts, e_meta)
-        z_event = self.gate_event(event_control, e_meta)
-        return torch.stack([z_ts, z_event], dim=1)  # [B, 2, D]
+    def encode_embeddings(
+        self,
+        ts: torch.Tensor,
+        event_features: torch.Tensor,
+        metadata_features: torch.Tensor,
+        stable_context_features: Optional[torch.Tensor] = None,
+    ):
+        ts_embedding = self.ts_encoder(ts)
+        event_embedding = self.text_projection(event_features)
+        metadata_embedding = self.text_projection(metadata_features)
+        context_embeddings = None
+        if stable_context_features is not None:
+            if stable_context_features.numel() > 0:
+                context_embeddings = self.text_projection(stable_context_features)
+        return ts_embedding, event_embedding, metadata_embedding, context_embeddings
 
     def forward(
         self,
         ts: torch.Tensor,
         event_features: torch.Tensor,
-        meta_features: torch.Tensor,
-        w: float = 1.0,
-        return_dict: bool = False,
+        metadata_features: torch.Tensor,
+        stable_context_features: Optional[torch.Tensor] = None,
+        stable_context_mask: Optional[torch.Tensor] = None,
+        editing_strength: float | torch.Tensor = 1.0,
+        valid_negative_mask: Optional[torch.Tensor] = None,
+        compute_rvc: bool = True,
     ):
-        emb = self.encode(ts, event_features, meta_features)
-        log_volume = self.rvc(emb["ts"], emb["event"], emb["meta"])
-        fused = self.fuse(emb["ts"], emb["event"], emb["meta"], w=w)
-        x_hat = _flatten_output(self.ts_decoder(fused))
+        ts_embedding, event_embedding, metadata_embedding, context_embeddings = (
+            self.encode_embeddings(
+                ts,
+                event_features,
+                metadata_features,
+                stable_context_features,
+            )
+        )
 
-        out = {
+        event_conditioned_metadata, routing_weights = self.metadata_router(
+            event_embedding,
+            metadata_embedding,
+            context_embeddings,
+            stable_context_mask,
+        )
+
+        z_metadata, z_event = self.dual_path_fusion(
+            ts_embedding,
+            event_embedding,
+            metadata_embedding,
+            event_conditioned_metadata,
+        )
+
+        latent_gate = torch.sigmoid(
+            self.edit_gate(
+                torch.cat([z_metadata, z_event, event_conditioned_metadata], dim=-1)
+            )
+        )
+
+        strength = torch.as_tensor(
+            editing_strength,
+            device=z_metadata.device,
+            dtype=z_metadata.dtype,
+        )
+        if strength.ndim == 0:
+            strength = strength.view(1, 1)
+        elif strength.ndim == 1:
+            strength = strength.unsqueeze(-1)
+
+        editing_direction = z_event - z_metadata
+        edited_token = z_metadata + strength * latent_gate * editing_direction
+        tokens = torch.stack([z_metadata, edited_token], dim=1)
+        x_hat = self.decoder(tokens)
+
+        log_volume = None
+        if compute_rvc:
+            log_volume = self.rvc(
+                ts_embedding,
+                event_embedding,
+                metadata_embedding,
+            )
+
+        return {
             "x_hat": x_hat,
             "log_volume": log_volume,
-            "ts_emb": emb["ts"],
-            "event_emb": emb["event"],
-            "meta_emb": emb["meta"],
-            "fused": fused,
+            "ts_emb": ts_embedding,
+            "event_emb": event_embedding,
+            "meta_emb": metadata_embedding,
+            "event_conditioned_meta": event_conditioned_metadata,
+            "z_metadata": z_metadata,
+            "z_event": z_event,
+            "latent_gate": latent_gate,
+            "routing_weights": routing_weights,
+            "tokens": tokens,
         }
-        if return_dict:
-            return out
-
-        # Drop-in compatibility with the original training code:
-        # logits, ts_hat, mean, log_var = model(ts, text_features, var_features)
-        dummy_log_var = torch.zeros_like(emb["ts"])
-        return log_volume, x_hat, emb["ts"], dummy_log_var
 
     @torch.no_grad()
-    def generate(
+    def edit(
         self,
-        w: float,
         ts: torch.Tensor,
-        tx_f_tgt: torch.Tensor,
-        tx_f_src: Optional[torch.Tensor] = None,
-        var: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Generation API kept"""
-        if var is None:
-            raise ValueError("EMEdit requires metadata features `var` during generation.")
-        e_ts = self.ts_encoder(ts)
-        e_event = self.text_encoder(tx_f_tgt)
-        e_meta = self.meta_encoder(var)
-        e_src = self.text_encoder(tx_f_src) if tx_f_src is not None else e_event
-        if self.gen_w_src_text:
-            e_event = e_src
-        fused = self.fuse(e_ts, e_event, e_meta, w=w)
-        x_hat = _flatten_output(self.ts_decoder(fused))
-        # Return names follow the previous code: ts_hat, ts_emb_tgt, tx_emb_tgt, tx_emb_src
-        return x_hat, fused[:, 1, :], e_event, e_src
-
-
+        target_event_features: torch.Tensor,
+        metadata_features: torch.Tensor,
+        stable_context_features: Optional[torch.Tensor] = None,
+        stable_context_mask: Optional[torch.Tensor] = None,
+        editing_strength: float = 1.0,
+    ) -> torch.Tensor:
+        self.eval()
+        output = self.forward(
+            ts=ts,
+            event_features=target_event_features,
+            metadata_features=metadata_features,
+            stable_context_features=stable_context_features,
+            stable_context_mask=stable_context_mask,
+            editing_strength=editing_strength,
+            compute_rvc=False,
+        )
+        return output["x_hat"]
