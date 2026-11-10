@@ -111,7 +111,7 @@ def main():
             num_res_blocks=config.num_res_blocks,
             decoder_layers=config.decoder_layers,
             decoder_heads=config.decoder_heads,
-            dropout=config.dropout,
+            dropout=config.dropout, 
             rvc_eps=config.rvc_eps,
             rvc_tau0=config.rvc_tau0,
             rvc_tau_min=config.rvc_tau_min,
